@@ -5,13 +5,26 @@ const mongoose = require("mongoose");
 const helper = require("./test_helper");
 const app = require("../app");
 const api = supertest(app);
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
 
 const Blog = require("../models/blog");
+const User = require("../models/user");
 
 describe("When there is initially some blogs saved", () => {
+  let token;
+
   beforeEach(async () => {
-    await Blog.deleteMany();
-    const blogObjects = helper.initialBlogs.map(blog => new Blog(blog));
+    await User.deleteMany({});
+    const passwordHash = await bcrypt.hash("sekret", 10);
+    const user = new User({ username: "root", passwordHash });
+    await user.save();
+
+    token = jwt.sign({ username: user.username, id: user._id }, process.env.SECRET, { expiresIn: 60 * 60 });
+
+    await Blog.deleteMany({});
+    // Assign the created user as the owner of each blog
+    const blogObjects = helper.initialBlogs.map(blog => new Blog({ ...blog, user: user._id }));
     const promiseArray = blogObjects.map(blog => blog.save());
     await Promise.all(promiseArray);
   });
@@ -19,6 +32,7 @@ describe("When there is initially some blogs saved", () => {
   test("blogs are returned as json", async () => {
     await api
       .get("/api/blogs")
+      .set("Authorization", `Bearer ${token}`)
       .expect(200)
       .expect("Content-Type", /application\/json/);
   });
@@ -26,11 +40,11 @@ describe("When there is initially some blogs saved", () => {
   test("blogs identifier property is named id and not _id", async () => {
     await api
       .get("/api/blogs")
+      .set("Authorization", `Bearer ${token}`)
       .expect(200)
       .expect(response => {
         const blogs = response.body;
         blogs.forEach(blog => {
-          console.log(blog);
           if (!("id" in blog)) throw new Error("id property not found");
         });
       });
@@ -49,6 +63,7 @@ describe("When there is initially some blogs saved", () => {
 
       const response = await api
         .post("/api/blogs")
+        .set("Authorization", `Bearer ${token}`)
         .send(newBlog)
         .expect(201)
         .expect("Content-Type", /application\/json/);
@@ -72,6 +87,7 @@ describe("When there is initially some blogs saved", () => {
 
       await api
         .post("/api/blogs")
+        .set("Authorization", `Bearer ${token}`)
         .send(newBlog)
         .expect(201)
         .expect("Content-Type", /application\/json/);
@@ -92,6 +108,7 @@ describe("When there is initially some blogs saved", () => {
 
       await api
         .post("/api/blogs")
+        .set("Authorization", `Bearer ${token}`)
         .send(newBlog)
         .expect(400)
         .expect("Content-Type", /application\/json/);
@@ -101,9 +118,12 @@ describe("When there is initially some blogs saved", () => {
   describe("Deletion of a blog", () => {
     test("succeeds with status code 204 if id is valid", async () => {
       const blogsAtStart = await helper.blogsInDb();
+      console.log(blogsAtStart);
       const blogToDelete = blogsAtStart[0];
 
-      await api.delete(`/api/blogs/${blogToDelete.id}`).expect(204);
+      console.log(blogToDelete);
+
+      await api.delete(`/api/blogs/${blogToDelete.id}`).set("Authorization", `Bearer ${token}`).expect(204);
 
       const blogsAtEnd = await helper.blogsInDb();
 
@@ -120,7 +140,11 @@ describe("When there is initially some blogs saved", () => {
       const blogToUpdate = blogsAtStart[0];
 
       const updatedLikes = blogToUpdate.likes + 100;
-      await api.put(`/api/blogs/${blogToUpdate.id}`).send({ likes: updatedLikes }).expect(200);
+      await api
+        .put(`/api/blogs/${blogToUpdate.id}`)
+        .set("Authorization", `Bearer ${token}`)
+        .send({ likes: updatedLikes })
+        .expect(200);
 
       const blogsAtEnd = await helper.blogsInDb();
       const contents = blogsAtEnd.map(r => r.likes);
@@ -129,6 +153,67 @@ describe("When there is initially some blogs saved", () => {
   });
 });
 
+describe("when there is initially one user in db", () => {
+  beforeEach(async () => {
+    await User.deleteMany({});
+    const passwordHash = await bcrypt.hash("sekret", 10);
+    const user = new User({ username: "root", passwordHash });
+    await user.save();
+
+    token = jwt.sign({ username: user.username, id: user._id }, process.env.SECRET, { expiresIn: 60 * 60 });
+
+    await Blog.deleteMany({});
+    // Assign the created user as the owner of each blog
+    const blogObjects = helper.initialBlogs.map(blog => new Blog({ ...blog, user: user._id }));
+    const promiseArray = blogObjects.map(blog => blog.save());
+    await Promise.all(promiseArray);
+  });
+
+  test("creation succeeds with a fresh username", async () => {
+    const usersAtStart = await helper.usersInDb();
+
+    const newUser = {
+      username: "mluukkai",
+      name: "Matti Luukkainen",
+      password: "salainen",
+    };
+
+    await api
+      .post("/api/users")
+      .send(newUser)
+      .expect(201)
+      .expect("Content-Type", /application\/json/);
+
+    const usersAtEnd = await helper.usersInDb();
+    assert.strictEqual(usersAtEnd.length, usersAtStart.length + 1);
+
+    const usernames = usersAtEnd.map(u => u.username);
+    assert(usernames.includes(newUser.username));
+  });
+
+  test("creation fails with proper statuscode and message if username already taken", async () => {
+    const usersAtStart = await helper.usersInDb();
+
+    const newUser = {
+      username: "root",
+      name: "Superuser",
+      password: "salainen",
+    };
+
+    const result = await api
+      .post("/api/users")
+      .send(newUser)
+      .expect(400)
+      .expect("Content-Type", /application\/json/);
+
+    const usersAtEnd = await helper.usersInDb();
+    assert(result.body.error.includes("expected `username` to be unique"));
+
+    assert.strictEqual(usersAtEnd.length, usersAtStart.length);
+  });
+});
+
 after(async () => {
+  await User.deleteMany({});
   await mongoose.connection.close();
 });
